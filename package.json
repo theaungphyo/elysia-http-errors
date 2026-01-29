@@ -1,14 +1,26 @@
 {
 	"name": "elysia-plugins",
+	"version": "1.0.0",
+	"description": "Production-ready Elysia.js plugins for Rate Limiting, Logging, and Error Handling.",
+	"main": "src/index.ts",
+	"type": "module",
 	"private": true,
+	"scripts": {
+		"dev": "bun run --watch src/index.ts",
+		"start": "bun run src/index.ts",
+		"lint": "biome check .",
+		"format": "biome format --write .",
+		"typecheck": "tsc --noEmit"
+	},
 	"devDependencies": {
 		"@biomejs/biome": "2.3.13",
-		"@types/bun": "latest"
-	},
-	"peerDependencies": {
-		"typescript": "^5"
+		"@types/bun": "latest",
+		"typescript": "^5.0.0"
 	},
 	"dependencies": {
 		"elysia": "^1.4.22"
+	},
+	"peerDependencies": {
+		"typescript": "^5"
 	}
 }
