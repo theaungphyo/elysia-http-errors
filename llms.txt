@@ -1,26 +1,153 @@
-System prompt for LLM usage in this repo:
-- You are a developer-focused documentation assistant.
-- Use the repository docs (README.md, PLUGIN_GUIDE.md, DOCS.md, and search-metadata.json) as reference.
-- Provide concise, actionable answers; prefer code blocks for examples; ASCII only unless the file already uses Unicode.
-- Follow clean code principles: clear naming, small focused examples, and explicit steps.
-- When suggesting changes, indicate file paths and a short rationale.
-- Do not reveal sensitive information; if unsure, propose safe defaults.
+# Elysia Plugin Collection (Full Context)
 
-Example QA:
- - Q: What versions of Elysia and Bun are required?
- - A: Minimum compatible versions are Elysia >= 1.3.5 and Bun >= 1.3.5 as per DOCS.md and compatibility in search-metadata.json.
+This document contains the complete source code and architectural patterns for three essential Elysia.js plugins: Rate Limiting (Redis-based), HTTP Logging, and Global Error Handling.
 
-Guidelines for generating edits and responses
-- Keep edits minimal and targeted; prefer patch diffs over larger rewrites.
-- When updating versions, propagate across all relevant files: package references in docs (README, DOCS.md), search-metadata.json, and any compatibility notes in PLUGIN_GUIDE.md.
-- Ensure human readability: explain why the change is needed and how it aligns with project goals.
-- Use ASCII by default; only include non-ASCII if the source file already uses it.
-- Reference file paths with inline code formatting for clarity: `path/to/file`.
-- Include small, self-contained code blocks to illustrate changes or examples.
-- If multiple changes are needed, outline them as bullet steps and provide a patch per file.
-- Do not expose or modify secrets, credentials, or private keys.
-- After applying changes, note the files touched and the rationale.
+## Table of Contents
 
-Notes on usage
-- For version bumps in this repo, the target is: elysia >= 1.3.5 and bun >= 1.3.5.
-- If a user asks for deeper refactors, propose a staged update with tests and docs updated accordingly.
+1. [Rate Limit Plugin](https://www.google.com/search?q=%23rate-limit-plugin) - Atomic Redis-based limiting.
+2. [HTTP Logger Plugin](https://www.google.com/search?q=%23http-logger-plugin) - High-resolution request timing.
+3. [Global Error Plugin](https://www.google.com/search?q=%23global-error-plugin) - Standardized HTTP responses and validation mapping.
+
+---
+
+## Rate Limit Plugin
+
+Implements a sliding window rate limiter using a Lua script to ensure atomicity between incrementing the counter and setting expiration.
+
+```typescript
+import type { RedisClient } from "bun";
+import { Elysia } from "elysia";
+
+interface RateLimitOptions {
+	redis: RedisClient;
+	limit?: number;
+	duration?: number;
+	keyPrefix?: string;
+}
+
+const ATOMIC_INCR_EXPIRE = `
+    local current = redis.call("INCR", KEYS[1])
+    if current == 1 then
+        redis.call("EXPIRE", KEYS[1], ARGV[1])
+    end
+    return current
+`;
+
+export function rateLimit(options: RateLimitOptions) {
+	const { redis, limit = 10, duration = 60, keyPrefix = "rate-limit" } = options;
+
+	return new Elysia({ name: "rate-limit" })
+		.derive({ as: "global" }, ({ server, request }) => {
+			const clientIp = server?.requestIP(request)?.address || request.headers.get("x-forwarded-for") || "unknown";
+			return { clientIp };
+		})
+		.onBeforeHandle({ as: "global" }, async ({ set, clientIp }) => {
+			const key = `${keyPrefix}:${clientIp}`;
+			try {
+				const result = await redis.send("EVAL", [ATOMIC_INCR_EXPIRE, "1", key, duration.toString()]);
+				const currentCount = Number(result);
+
+				set.headers["X-RateLimit-Limit"] = limit.toString();
+				set.headers["X-RateLimit-Remaining"] = Math.max(0, limit - currentCount).toString();
+				set.headers["X-RateLimit-Reset"] = (Math.floor(Date.now() / 1000) + duration).toString();
+
+				if (currentCount > limit) {
+					set.status = 429;
+					set.headers["Retry-After"] = duration.toString();
+					return { error: "Too Many Requests", message: `Limit exceeded: ${limit} requests per ${duration}s.` };
+				}
+			} catch (error) {
+				console.error("Rate Limit Error:", error);
+			}
+		});
+}
+
+```
+
+---
+
+## HTTP Logger Plugin
+
+Captures request metadata and calculates duration using the `performance` API.
+
+```typescript
+import Elysia from "elysia";
+
+function formatLogMessage(req: Request, startTime: number, status?: number | string): string {
+	const duration = (performance.now() - startTime).toFixed(2);
+	const path = new URL(req.url).pathname;
+	return `${req.method} ${path} ${status ?? "?"} - completed in ${duration}ms`;
+}
+
+export function httpLogger() {
+	return new Elysia({ name: "http-logger" })
+		.derive({ as: "global" }, () => ({ requestStartTime: performance.now() }))
+		.onAfterHandle({ as: "global" }, ({ request, set, requestStartTime }) => {
+			console.info(formatLogMessage(request, requestStartTime, set.status));
+		})
+		.onError({ as: "global" }, ({ request, set, requestStartTime }) => {
+			const safeStartTime = requestStartTime ?? performance.now();
+			console.error(formatLogMessage(request, safeStartTime, set.status));
+		});
+}
+
+```
+
+---
+
+## Global Error Plugin
+
+Standardizes API error shapes and handles TypeBox validation errors.
+
+```typescript
+import Elysia, { type ValidationError } from "elysia";
+
+export class HttpError extends Error {
+	public readonly code: string;
+	public readonly status: number;
+	public readonly details: unknown;
+
+	constructor(message: string = "Internal Server Error", status: number = 500, code: string = "INTERNAL_SERVER_ERROR", details: unknown = null) {
+		super(message);
+		this.status = status;
+		this.code = code;
+		this.details = details;
+		this.name = this.constructor.name;
+	}
+
+	static BadRequest(m?: string, d?: unknown) { return new HttpError(m || "Bad Request", 400, "BAD_REQUEST", d); }
+	static Unauthorized(m?: string, d?: unknown) { return new HttpError(m || "Unauthorized", 401, "UNAUTHORIZED", d); }
+	static Forbidden(m?: string, d?: unknown) { return new HttpError(m || "Forbidden", 403, "FORBIDDEN", d); }
+	static NotFound(m?: string, d?: unknown) { return new HttpError(m || "Not Found", 404, "NOT_FOUND", d); }
+    static InternalServer(m?: string, d?: unknown) { return new HttpError(m || "Internal Server Error", 500, "INTERNAL_SERVER_ERROR", d); }
+    // ... (Additional static methods omitted for brevity in llms-full context)
+}
+
+function formatValidationErrors(allErrors: ValidationError["all"]): Record<string, string> {
+	return allErrors.reduce((acc, err) => {
+		acc[err.path] = err.message;
+		return acc;
+	}, {} as Record<string, string>);
+}
+
+export function httpError() {
+	return new Elysia({ name: "http-errors" })
+		.error({ HTTP_ERROR: HttpError })
+		.onError({ as: "global" }, ({ code, error, set }) => {
+			console.error(`Error: ${code}`, error);
+			if (code === "VALIDATION") {
+				set.status = error.status;
+				return { code: "VALIDATION_ERROR", message: error.message, errors: formatValidationErrors(error.all), status: error.status };
+			}
+			if (code === "HTTP_ERROR") {
+				set.status = error.status;
+				return { code: error.code, message: error.message, status: error.status, details: error.details };
+			}
+			set.status = 500;
+			return { code: "INTERNAL_SERVER_ERROR", message: "Internal Server Error" };
+		});
+}
+
+```
+
+---
